@@ -1,0 +1,149 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+
+use Config ();
+use Errno ();
+use Getopt::Long ();
+use IO::Handle;
+use POSIX ();
+
+use constant DEBUG => $ENV{PINI_DEBUG} ? 1 : 0;
+
+our $VERSION = '0.01';
+
+sub _now {
+    POSIX::strftime("%Y-%m-%dT%H:%M:%S%z", localtime);
+}
+
+sub new {
+    my $class = shift;
+    bless {}, $class;
+}
+
+sub parse_options {
+    my $self = shift;
+
+    local @ARGV = @_;
+    Getopt::Long::Configure qw(
+        bundling
+        no_auto_abbrev
+        no_ignore_case
+    );
+    Getopt::Long::GetOptions
+        "h|help" => \my $help,
+        "v|version" => \my $version,
+    or exit 1;
+    if ($version) {
+        print $VERSION, "\n";
+        exit 0;
+    }
+    if ($help) {
+        print "Usage: pini -- command arguments...\n";
+        exit 1;
+    }
+
+    return @ARGV;
+}
+
+sub run {
+    my $self = shift;
+    my @cmd = $self->parse_options(@_);
+
+    my ($child_pid, $exit) = $self->exec(@cmd);
+    return $exit if $exit;
+
+    my $SIGNAL = '';
+    for my $name (grep { $_ ne 'ZERO' } split /\s+/, $Config::Config{sig_name}) {
+        $SIG{$name} = sub { $SIGNAL = $_[0] };
+    }
+
+    while (1) {
+        my $count = select undef, undef, undef, 1;
+        my $signal = $SIGNAL; # copy
+        $SIGNAL = '';
+        if ($count == -1) {
+            if ($signal eq 'CHLD') {
+                # noop
+            } else {
+                DEBUG and warn _now, " send signal $signal to our child $child_pid";
+                kill $signal, $child_pid;
+            }
+        }
+        my $exit = $self->wait($child_pid);
+        if ($exit != -1) {
+            return $exit;
+        }
+    }
+}
+
+sub wait :method {
+    my ($self, $child_pid) = @_;
+
+    while (1) {
+        my $pid = waitpid -1, POSIX::WNOHANG;
+        my $exit_status = $?;
+        if ($pid == 0) {
+            last;
+        } elsif ($pid == -1) {
+            die "UNEXPECTED";
+        }
+
+        if ($pid == $child_pid) {
+            DEBUG and warn _now, " reaped our child process $pid, exit_status $exit_status";
+            return $self->_exit_code($exit_status);
+        } else {
+            DEBUG and warn _now, " reaped defunct process $pid, exit_status $exit_status";
+        }
+    }
+    return -1;
+}
+
+sub _exit_code {
+    my ($self, $exit_status) = @_;
+    my $code = $exit_status >> 8;
+    if (my $signal = $exit_status & 127) {
+        $code = 128 + $signal;
+    }
+    return $code;
+}
+
+sub exec :method {
+    my ($self, @cmd) = @_;
+
+    pipe my ($read, $write) or die "$!: pipe failed\n";
+    $write->autoflush(1);
+    my $pid = fork;
+    defined $pid or die "$!: fork failed\n";
+    if ($pid == 0) {
+        close $read;
+        DEBUG and warn _now, " exec @cmd\n";
+        {
+            no warnings 'exec';
+            exec { $cmd[0] } @cmd;
+        }
+        my $errno = $!;
+        if ($errno == Errno::ENOENT) {
+            syswrite $write, "127";
+        } elsif ($errno == Errno::EACCES) {
+            syswrite $write, "126";
+        } else {
+            syswrite $write, "-1";
+        }
+        close $write;
+        exit;
+    }
+    close $write;
+    my $exit = <$read> || 0;
+    close $read;
+    if ($exit != 0) {
+        waitpid $pid, 0;
+    }
+    return ($pid, $exit);
+}
+
+if (!caller) {
+    my $app = __PACKAGE__->new;
+    my $exit = $app->run(@ARGV);
+    exit $exit;
+}
