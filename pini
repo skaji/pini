@@ -54,21 +54,21 @@ sub run {
     return $exit if $exit;
 
     my $SIGNAL = '';
-    for my $name (grep { $_ ne 'ZERO' } split /\s+/, $Config::Config{sig_name}) {
+    for my $name (grep { $_ ne 'ZERO' && $_ ne 'KILL' } split /\s+/, $Config::Config{sig_name}) {
         $SIG{$name} = sub { $SIGNAL = $_[0] };
     }
 
     while (1) {
-        my $count = select undef, undef, undef, 1;
+        my $count = select undef, undef, undef, 0.1;
         my $signal = $SIGNAL; # copy
         $SIGNAL = '';
-        if ($count == -1) {
-            if ($signal eq 'CHLD') {
-                # noop
-            } else {
-                DEBUG and warn _now, " send signal $signal to our child $child_pid";
-                kill $signal, $child_pid;
-            }
+
+        if ($signal eq 'CHLD' || $signal eq 'CLD') {
+            DEBUG and warn _now, " got signal $signal";
+            # noop
+        } elsif ($signal) {
+            DEBUG and warn _now, " send signal $signal to our child $child_pid";
+            kill $signal, $child_pid;
         }
         my $exit = $self->wait($child_pid);
         if ($exit != -1) {
@@ -81,7 +81,7 @@ sub wait :method {
     my ($self, $child_pid) = @_;
 
     while (1) {
-        my $pid = waitpid -1, POSIX::WNOHANG;
+        my $pid = waitpid -1, POSIX::WNOHANG();
         my $exit_status = $?;
         if ($pid == 0) {
             last;
@@ -122,24 +122,25 @@ sub exec :method {
             no warnings 'exec';
             exec { $cmd[0] } @cmd;
         }
-        my $errno = $!;
-        if ($errno == Errno::ENOENT) {
-            syswrite $write, "127";
-        } elsif ($errno == Errno::EACCES) {
-            syswrite $write, "126";
-        } else {
-            syswrite $write, "-1";
-        }
+        syswrite $write, $!+0;
         close $write;
         exit;
     }
     close $write;
-    my $exit = <$read> || 0;
+    my $errno = <$read> || 0;
     close $read;
-    if ($exit != 0) {
-        waitpid $pid, 0;
+    return $pid if $errno == 0;
+
+    waitpid $pid, 0;
+    $! = $errno;
+    warn "Can't exec $cmd[0]: $!\n";
+    my $exit = -1;
+    if ($errno == Errno::ENOENT) {
+        $exit = 127;
+    } elsif ($errno == Errno::EACCES) {
+        $exit = 126;
     }
-    return ($pid, $exit);
+    return (undef, $exit);
 }
 
 if (!caller) {
